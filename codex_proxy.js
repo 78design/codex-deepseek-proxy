@@ -5,12 +5,10 @@
  * Translates the OpenAI Responses API (used by Codex CLI v0.135.0)
  * to DeepSeek's /v1/chat/completions API, including tool call support.
  *
- * Fixed v2:
- *   - reasoning_content 严格绑定到紧随的 assistant 消息
- *   - function_call_output 的 call_id 空值回退
- *   - 未知工具类型不再简单丢弃，尝试提取有用信息
- *   - 400 错误时优雅降级而非无限重试
- *   - 更详细的调试日志
+ * v1.0.0 — 核心修复：
+ *   - 连续的 function_call item 合并为单条 assistant(tc:N) 消息（而非互不相连的 N 条）
+ *   - text-only assistant 的文本和 reasoning_content 自动提升到后续 tool_calls assistant
+ *   - flush-on-boundary 策略确保 tool results 紧随正确的 assistant 消息
  */
 
 const http = require('http');
@@ -123,14 +121,70 @@ function fallbackCallId() {
   return 'fallback_call_' + (++_fallbackIdx) + '_' + Math.random().toString(36).substring(2, 8);
 }
 
+/**
+ * 核心翻译：Codex Responses API input items → DeepSeek Chat Completions messages
+ *
+ * Codex 的 input 是扁平 item 列表，每个 tool call / tool result / message 都是独立 item。
+ * DeepSeek 要求严格的 assistant(tool_calls) → tool → tool  配对。
+ *
+ * 策略：
+ *   - 连续的 function_call item 累积到 pendingToolCalls
+ *   - 遇到第一个 function_call_output 时，先将 pendingToolCalls 合并成一个 assistant(tc:N) 消息 flush
+ *   - reasoning_content 必须放在有 tool_calls 的 assistant 上（DeepSeek V4 强制要求）
+ *   - 如果 function_call 前有一个 text-only assistant，将其文本和 reasoning 合并到 tool_calls assistant 里
+ */
 function translateInput(input) {
-  const messages = [];
   if (!Array.isArray(input)) {
-    messages.push({ role: 'user', content: String(input) });
-    return messages;
+    return [{ role: 'user', content: String(input) }];
   }
 
-  let pendingReasoning = ''; // reasoning_content 等待附加到下一个 assistant
+  const messages = [];
+  let pendingReasoning = '';
+  const pendingToolCalls = [];       // 累积的 function_call 项
+
+  // flushPendingToolCalls — 将所有累积的 function_call 合并成一条 assistant(tc:N) 消息
+  function flushPendingToolCalls() {
+    if (pendingToolCalls.length === 0) return;
+
+    // 构建合并后的 tool_calls 数组
+    const mergedToolCalls = pendingToolCalls.map(tc => ({
+      id: tc.id,
+      type: 'function',
+      function: tc.function
+    }));
+
+    const msg = {
+      role: 'assistant',
+      content: null,
+      tool_calls: mergedToolCalls
+    };
+
+    // reasoning_content 必须在此 assistant 上
+    if (pendingReasoning) {
+      msg.reasoning_content = pendingReasoning;
+      pendingReasoning = '';
+    }
+
+    // 检查前一条消息：如果是 assistant（text-only），把它合并进来
+    if (messages.length > 0) {
+      const prev = messages[messages.length - 1];
+      if (prev.role === 'assistant' && !prev.tool_calls) {
+        // 将文本内容提升到 tool_calls assistant
+        if (prev.content) {
+          msg.content = prev.content;
+        }
+        // 如果前一条有 reasoning_content，也合并
+        if (prev.reasoning_content) {
+          msg.reasoning_content = (msg.reasoning_content || '') + prev.reasoning_content;
+        }
+        messages.pop(); // 移除 text-only assistant
+      }
+    }
+
+    messages.push(msg);
+    pendingToolCalls.length = 0;
+    console.log('[MERGE] flushed', mergedToolCalls.length, 'tool_calls into single assistant message');
+  }
 
   for (let i = 0; i < input.length; i++) {
     const item = input[i];
@@ -143,7 +197,6 @@ function translateInput(input) {
 
       // ---- reasoning ----
       case 'reasoning': {
-        // 累积 reasoning 文本，附加到紧随的下一个 assistant 消息
         pendingReasoning = (pendingReasoning || '') + extractReasoningText(item);
         break;
       }
@@ -154,6 +207,9 @@ function translateInput(input) {
         const mappedRole = role === 'developer' ? 'system' : role;
 
         if (mappedRole === 'assistant') {
+          // 遇到新的 assistant 消息 → 先 flush 之前的 tool_calls（如果有）
+          flushPendingToolCalls();
+
           let text = '';
           const toolCalls = [];
 
@@ -171,7 +227,6 @@ function translateInput(input) {
                   }
                 });
               } else if (c.type === 'reasoning_summary') {
-                // 有些实现把 reasoning 嵌在 assistant content 里
                 pendingReasoning = (pendingReasoning || '') + (c.text || '');
               }
             }
@@ -179,19 +234,26 @@ function translateInput(input) {
             text = item.content;
           }
 
-          const msg = toolCalls.length > 0
-            ? { role: 'assistant', content: text || null, tool_calls: toolCalls }
-            : { role: 'assistant', content: text || '' };
-
-          // 将 pendingReasoning 附加到当前 assistant
-          if (pendingReasoning) {
-            msg.reasoning_content = pendingReasoning;
-            pendingReasoning = '';
+          if (toolCalls.length > 0) {
+            // assistant 里已嵌有 tool_calls → 直接使用
+            const msg = { role: 'assistant', content: text || null, tool_calls: toolCalls };
+            if (pendingReasoning) {
+              msg.reasoning_content = pendingReasoning;
+              pendingReasoning = '';
+            }
+            messages.push(msg);
+          } else {
+            // text-only assistant — 推入暂存，后续 function_call 可能会合并它
+            const msg = { role: 'assistant', content: text || '' };
+            if (pendingReasoning) {
+              msg.reasoning_content = pendingReasoning;
+              pendingReasoning = '';
+            }
+            messages.push(msg);
           }
-
-          messages.push(msg);
         } else {
-          // user 或 system — 清空 pending reasoning
+          // user / system → 先 flush tool_calls
+          flushPendingToolCalls();
           pendingReasoning = '';
           messages.push({
             role: mappedRole,
@@ -201,10 +263,29 @@ function translateInput(input) {
         break;
       }
 
+      // ---- function_call (standalone, Codex 把模型 tool call 拆成独立 item) ----
+      case 'function_call': {
+        // 不立即创建消息，累积到缓冲区
+        pendingToolCalls.push({
+          id: item.call_id || callId(),
+          type: 'function',
+          function: {
+            name: item.name || '',
+            arguments: typeof item.arguments === 'string'
+              ? item.arguments
+              : JSON.stringify(item.arguments || {})
+          }
+        });
+        break;
+      }
+
       // ---- function_call_output / tool_result ----
       case 'function_call_output':
       case 'tool_result': {
+        // 先 flush 累积的 tool_calls（此时它们必须出现在 tool results 前面）
+        flushPendingToolCalls();
         pendingReasoning = '';
+
         const callIdVal = item.call_id || '';
         messages.push({
           role: 'tool',
@@ -216,43 +297,19 @@ function translateInput(input) {
         break;
       }
 
-      // ---- function_call (standalone, from output -> next input) ----
-      case 'function_call': {
-        pendingReasoning = '';
-        const fcCallId = item.call_id || callId();
-        messages.push({
-          role: 'assistant',
-          content: null,
-          tool_calls: [{
-            id: fcCallId,
-            type: 'function',
-            function: {
-              name: item.name || '',
-              arguments: typeof item.arguments === 'string'
-                ? item.arguments
-                : JSON.stringify(item.arguments || {})
-            }
-          }]
-        });
-        break;
-      }
-
-      // ---- 自定义/未知工具的结果 ----
-      // Codex 特有类型（custom / tool_search / web_search_call 等）：
-      //   工具定义在转发时被丢弃了，但 Codex 可能返回其执行结果。
-      //   把这些结果映射为 tool 消息，用 item.id 做 call_id。
+      // ---- 自定义/未知工具结果 ----
       case 'custom_output':
       case 'tool_search_output':
       case 'web_search_call_output': {
+        flushPendingToolCalls();
         pendingReasoning = '';
         const tcId = item.call_id || item.id || fallbackCallId();
-        const outContent = typeof item.output === 'string'
-          ? item.output
-          : JSON.stringify(item.output || item.result || item.content || '');
         messages.push({
           role: 'tool',
           tool_call_id: tcId,
-          content: outContent
+          content: typeof item.output === 'string'
+            ? item.output
+            : JSON.stringify(item.output || item.result || item.content || '')
         });
         console.log('[TRACE] mapped unknown-type output:', item.type, '→ tool, call_id=', tcId);
         break;
@@ -262,34 +319,34 @@ function translateInput(input) {
       case 'custom':
       case 'tool_search':
       case 'web_search_call': {
+        flushPendingToolCalls();
         pendingReasoning = '';
         const tcId = item.call_id || item.id || fallbackCallId();
-        messages.push({
-          role: 'assistant',
-          content: null,
-          tool_calls: [{
-            id: tcId,
-            type: 'function',
-            function: {
-              name: item.type || 'unknown_tool',
-              arguments: JSON.stringify(item.arguments || item.input || {})
-            }
-          }]
+        pendingToolCalls.push({
+          id: tcId,
+          type: 'function',
+          function: {
+            name: item.type || item.name || 'unknown_tool',
+            arguments: typeof item.arguments === 'string'
+              ? item.arguments
+              : JSON.stringify(item.arguments || item.input || {})
+          }
         });
+        // 立即 flush 单个调用
+        flushPendingToolCalls();
         console.log('[TRACE] mapped unknown-type tool call:', item.type, '→ assistant tool_call');
         break;
       }
 
-      // ---- item_reference / item_reference_output — 跳过 ----
+      // ---- 跳过 ----
       case 'item_reference':
       case 'item_reference_output':
-        // 这些是 Codex 内部引用，跳过
         break;
 
       // ---- 兜底 ----
       default: {
         console.warn('[WARN] Unknown input item type:', item.type, '— trying best-effort mapping');
-        // 尝试从 item 中提取可用的角色和内容
+        flushPendingToolCalls();
         if (item.role) {
           pendingReasoning = '';
           messages.push({
@@ -297,12 +354,10 @@ function translateInput(input) {
             content: extractTextFromContent(item.content) || JSON.stringify(item)
           });
         } else if (item.output || item.content) {
-          // 如果一个未知类型有 output/content，可能是工具结果
           pendingReasoning = '';
-          const fallbackTcId = item.call_id || item.id || fallbackCallId();
           messages.push({
             role: 'tool',
-            tool_call_id: fallbackTcId,
+            tool_call_id: item.call_id || item.id || fallbackCallId(),
             content: typeof item.output === 'string'
               ? item.output
               : JSON.stringify(item.output || item.content || item)
@@ -314,61 +369,20 @@ function translateInput(input) {
     }
   }
 
-  // 最后再遍历一遍，确保每个 assistant 的 tool_calls 数量与实际 tool 消息匹配
-  // 如果检测到不匹配，尝试修复
-  return validateAndFixMessages(messages);
-}
+  // 循环结束时 flush 残余的 tool_calls
+  flushPendingToolCalls();
 
-// ---------------------------------------------------------------------------
-// 验证并修复消息链：确保 tool_calls 与后续 tool 消息匹配
-// ---------------------------------------------------------------------------
-function validateAndFixMessages(messages) {
-  const fixed = [];
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-
-    if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
-      fixed.push(msg);
-      const expectedCount = msg.tool_calls.length;
-      let actualCount = 0;
-
-      // 收集后续 tool 消息
-      const toolMsgs = [];
-      let j = i + 1;
-      while (j < messages.length && messages[j].role === 'tool') {
-        toolMsgs.push(messages[j]);
-        actualCount++;
-        j++;
-      }
-
-      if (actualCount < expectedCount) {
-        console.warn('[FIXUP] assistant has', expectedCount, 'tool_calls but only', actualCount, 'tool messages follow — injecting missing');
-        // 不注入假消息（会破坏工具调用链），只记录警告
-        // DeepSeek 应该拒绝这个请求，错误会被上层处理
-      }
-
-      // 推入 tool 消息
-      for (const tm of toolMsgs) {
-        fixed.push(tm);
-      }
-      i += actualCount;
-    } else {
-      fixed.push(msg);
+  // 如果最后一条是纯 reasoning 的 assistant 没有内容也没有 tool_calls，移除
+  const last = messages[messages.length - 1];
+  if (last && last.role === 'assistant' && !last.tool_calls && (!last.content || last.content === '')) {
+    // 只保留 reasoning_content 的情况：如果没内容，DeepSeek 也会拒绝
+    if (!last.reasoning_content || last.reasoning_content === '') {
+      messages.pop();
+      console.log('[CLEANUP] removed empty trailing assistant');
     }
   }
 
-  // 检查最后的 assistant 是否有未匹配的 tool_calls
-  const lastIdx = fixed.length - 1;
-  if (lastIdx >= 0 && fixed[lastIdx].role === 'assistant' && fixed[lastIdx].tool_calls && fixed[lastIdx].tool_calls.length > 0) {
-    console.warn('[FIXUP] Last message is assistant with', fixed[lastIdx].tool_calls.length, 'tool_calls but no tool results — removing trailing tool_calls');
-    // 如果这是最后一条消息，移除 tool_calls（可能是 Codex 还没执行工具就重试了）
-    delete fixed[lastIdx].tool_calls;
-    if (fixed[lastIdx].content === null) {
-      fixed[lastIdx].content = ''; // 防止 null content
-    }
-  }
-
-  return fixed;
+  return messages;
 }
 
 // ---------------------------------------------------------------------------
@@ -851,5 +865,5 @@ http.createServer(function (req, res) {
 }).listen(PORT, '127.0.0.1', function () {
   console.log('[codex_proxy] Running on http://127.0.0.1:' + PORT + '/v1/responses');
   console.log('[codex_proxy] Translating Responses API -> DeepSeek Chat Completions API');
-  console.log('[codex_proxy] Version: v2 (with input validation & fixup)');
+  console.log('[codex_proxy] Version: v3 (merge consecutive function_calls into single assistant)');
 });
