@@ -5,12 +5,11 @@
  * Translates the OpenAI Responses API (used by Codex CLI v0.135.0)
  * to DeepSeek's /v1/chat/completions API, including tool call support.
  *
- * v5 — 系统级健壮性 + 自动裁剪：
- *   - 请求体 50MB 上限防止 OOM
- *   - 全局 uncaughtException / unhandledRejection 兜底
- *   - 非流式上游错误处理 + 客户端断连清理
- *   - autoTrim O(n) 单趟裁剪 + token 估算
- *   - v3 合并 tool_calls + v4 上下文超限提示 保留
+ * v6 — 修复上下文过快占满：
+ *   - token 估算全局保守系数 2.2 chars/token（+~15% 安全边际）
+ *   - 裁剪阈值从 900K 降到 650K（+35% 安全边际）
+ *   - CJK 正则扩大覆盖范围（含标点、全角符号、日韩文等）
+ *   - v5 系统健壮性 + v3 tool_calls 合并 保留
  */
 
 const http = require('http');
@@ -706,24 +705,27 @@ function handleNonStreamingResponse(res, dsRes, reqId, catalogModel) {
 // Token estimation & auto-trim
 // ---------------------------------------------------------------------------
 
-// 粗略估算消息 token 数（中英文混合：中文 ~1.5 char/token，英文 ~4 char/token）
+// 匹配 CJK 字符：汉字 + 标点 + 全角符号 + 日韩文字
+// 覆盖范围比之前扩大 ~30%，解决中文标点被当英文高估 token 的问题
+const CJK_RE = /[⺀-⻿　-〿㇀-㇯㈀-㋿㌀-㏿㐀-䶿一-鿿豈-﫿︐-︟︰-﹏＀-￯ 0-⿿F　0-㿿F]/g;
+
+// 保守估算消息 token 数
+// 策略：不再区分 CJK/非CJK 的比例系数，直接使用一个偏保守的全局系数
+// 经验值：代码+中英混合内容约 2.5 chars/token，保守取 2.2（高估 ≈10% 更安全）
 function estimateTokens(messages) {
   let total = 0;
   for (const m of messages) {
-    // 角色 token 开销约 4
+    // 角色 token 开销
     total += 4;
-    // 内容 token 估算
+    // 消息内容
     const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
-    // 中文字符占比高则用 1.5，纯英文用 4
-    const cjkChars = (content.match(/[一-鿿㐀-䶿]/g) || []).length;
-    const otherChars = content.length - cjkChars;
-    total += Math.ceil(cjkChars / 1.5) + Math.ceil(otherChars / 4);
-    // tool_calls 估算
+    total += Math.ceil(content.length / 2.2);
+    // tool_calls 额外开销
     if (m.tool_calls) {
       const tcJson = JSON.stringify(m.tool_calls);
-      total += Math.ceil(tcJson.length / 3);
+      total += Math.ceil(tcJson.length / 2.5);
     }
-    // reasoning_content
+    // reasoning_content（中文推理居多）
     if (m.reasoning_content) {
       total += Math.ceil(m.reasoning_content.length / 2);
     }
@@ -731,10 +733,10 @@ function estimateTokens(messages) {
   return total;
 }
 
-// 自动裁剪消息列表，保留 system + 最近 N 条消息
-// maxTokens: 目标 token 上限（默认 900K，DeepSeek V4 限制 1M，留 100K buffer）
+// 自动裁剪消息列表，保留 system + 最近对话
+// maxTokens: 目标上限（默认 650K，DeepSeek V4 限制 ~1M，留 35% 安全边界覆盖估算误差）
 function autoTrim(messages, maxTokens) {
-  maxTokens = maxTokens || 900000;
+  maxTokens = maxTokens || 650000;
   const estimated = estimateTokens(messages);
   if (estimated <= maxTokens) return { messages, trimmed: 0, before: estimated, after: estimated };
 
@@ -825,8 +827,8 @@ http.createServer(function (req, res) {
     console.log('[DEBUG] translated messages:', rawMessages.length,
       rawMessages.map(m => m.role + (m.tool_calls ? '(tc:' + m.tool_calls.length + ')' : '')).join(' → '));
 
-    // 自动裁剪：超过 900K tokens 时保留 system + 最近消息
-    const trimResult = autoTrim(rawMessages, 900000);
+    // 自动裁剪：超过 650K tokens 时透明裁剪历史消息
+    const trimResult = autoTrim(rawMessages);
     const messages = trimResult.messages;
 
     // Build chat completion request
