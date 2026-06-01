@@ -1,6 +1,6 @@
 # Codex DeepSeek Proxy
 
-[![Version](https://img.shields.io/badge/version-1.0.2-blue)](./VERSION)
+[![Version](https://img.shields.io/badge/version-1.0.3-blue)](./VERSION)
 
 让 [OpenAI Codex CLI](https://github.com/openai/codex) 通过本地代理接入 [DeepSeek API](https://platform.deepseek.com/)，无需 OpenAI 付费账号。
 

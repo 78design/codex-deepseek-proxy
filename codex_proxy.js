@@ -5,10 +5,12 @@
  * Translates the OpenAI Responses API (used by Codex CLI v0.135.0)
  * to DeepSeek's /v1/chat/completions API, including tool call support.
  *
- * v5 — 自动裁剪上下文：
- *   - 请求前估算消息 token 数，超过 900K 时自动裁剪历史消息
- *   - 保留 system message + 最近对话，透明降级不中断用户体验
- *   - v4 上下文超限提示 + v3 核心修复保留
+ * v5 — 系统级健壮性 + 自动裁剪：
+ *   - 请求体 50MB 上限防止 OOM
+ *   - 全局 uncaughtException / unhandledRejection 兜底
+ *   - 非流式上游错误处理 + 客户端断连清理
+ *   - autoTrim O(n) 单趟裁剪 + token 估算
+ *   - v3 合并 tool_calls + v4 上下文超限提示 保留
  */
 
 const http = require('http');
@@ -692,6 +694,12 @@ function handleNonStreamingResponse(res, dsRes, reqId, catalogModel) {
       sendJsonErr(res, 502, 'Parse error: ' + e.message);
     }
   });
+  dsRes.on('error', function (e) {
+    console.error('[NONSTREAM_ERR]', e.message);
+    // res may already be ended; safe-guard
+    try { res.writeHead(502, { 'Content-Type': 'application/json' }); } catch (_) {}
+    try { res.end(JSON.stringify({ error: { message: 'Upstream error: ' + e.message, type: 'proxy_error' } })); } catch (_) {}
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -741,12 +749,14 @@ function autoTrim(messages, maxTokens) {
   const startIdx = sysIdx >= 0 ? sysIdx + 1 : 0;
   const tail = messages.slice(startIdx);
 
-  // 从尾部往前保留，直到 token 数在限制内
+  // 从尾部反向求和，单趟 O(n) 找到保留起点
   let tailStart = 0;
-  for (let i = 0; i < tail.length; i++) {
-    const candidate = [...kept, ...tail.slice(i)];
-    if (estimateTokens(candidate) <= maxTokens) {
-      tailStart = i;
+  let runningTokens = estimateTokens(kept);
+  // 从最后一条往前累加
+  for (let i = tail.length - 1; i >= 0; i--) {
+    runningTokens += estimateTokens([tail[i]]);
+    if (runningTokens > maxTokens) {
+      tailStart = i + 1; // 从下一条开始保留
       break;
     }
   }
@@ -767,6 +777,8 @@ function autoTrim(messages, maxTokens) {
 // Server
 // ---------------------------------------------------------------------------
 
+const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB 上限，防止内存溢出
+
 http.createServer(function (req, res) {
   if (req.method !== 'POST' || req.url !== '/v1/responses') {
     sendJsonErr(res, 404, 'Not Found. Use POST /v1/responses');
@@ -774,8 +786,18 @@ http.createServer(function (req, res) {
   }
 
   let body = '';
-  req.on('data', chunk => { body += chunk.toString(); });
+  let bodySize = 0;
+  req.on('data', chunk => {
+    bodySize += chunk.length;
+    if (bodySize > MAX_BODY_SIZE) {
+      sendJsonErr(res, 413, 'Request body too large');
+      req.destroy();
+      return;
+    }
+    body += chunk.toString();
+  });
   req.on('end', function () {
+    if (bodySize > MAX_BODY_SIZE) return;
     let reqBody;
     try {
       reqBody = JSON.parse(body);
@@ -788,6 +810,7 @@ http.createServer(function (req, res) {
     const isStream = reqBody.stream !== false;
     const maxTokens = reqBody.max_output_tokens || 8192;
     const model = reqBody.model || 'deepseek-v4-flash';
+    let dsReq = null; // 闭包变量，供 req.on('close') 清理
 
     // 调试：打印 input 结构
     if (reqBody.input && Array.isArray(reqBody.input)) {
@@ -865,7 +888,7 @@ http.createServer(function (req, res) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + KEY,
-        'Content-Length': Buffer.byteLength(postData)
+        'Content-Length': Buffer.byteLength(postData, 'utf8')
       },
       timeout: 300000
     };
@@ -873,7 +896,7 @@ http.createServer(function (req, res) {
     console.log('[REQ] model=%s messages=%d tools=%s stream=%s',
       model, messages.length, chatBody.tools ? chatBody.tools.length : 0, isStream);
 
-    const dsReq = https.request(options, function (dsRes) {
+    dsReq = https.request(options, function (dsRes) {
       // 处理非 200 响应
       if (dsRes.statusCode !== 200) {
         let errBody = '';
@@ -995,8 +1018,28 @@ http.createServer(function (req, res) {
   req.on('error', function (e) {
     console.error('[CLIENT_REQ_ERR]', e.message);
   });
+  // 客户端断开时销毁上游请求，避免连接泄漏
+  req.on('close', function () {
+    if (dsReq) { try { dsReq.destroy(); } catch (e) {} }
+  });
 }).listen(PORT, '127.0.0.1', function () {
   console.log('[codex_proxy] Running on http://127.0.0.1:' + PORT + '/v1/responses');
   console.log('[codex_proxy] Translating Responses API -> DeepSeek Chat Completions API');
-  console.log('[codex_proxy] Version: v3 (merge consecutive function_calls into single assistant)');
+  console.log('[codex_proxy] Version: v5 (auto trim + overflow guard + robustness)');
 });
+
+// 全局异常处理：防止未捕获异常导致代理崩溃
+process.on('uncaughtException', function (err) {
+  console.error('[FATAL_UNCAUGHT]', err.message, err.stack);
+});
+process.on('unhandledRejection', function (reason) {
+  console.error('[FATAL_REJECTION]', reason);
+});
+
+// 优雅退出
+function shutdown(signal) {
+  console.log('[SHUTDOWN] Received', signal, '— exiting');
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
