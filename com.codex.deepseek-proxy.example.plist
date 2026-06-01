@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.codex.deepseek-proxy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- 替换为你的 node 路径 (运行 `which node` 查看) -->
+        <string>/Users/YOUR_USERNAME/.nvm/versions/node/v22.0.0/bin/node</string>
+        <!-- 代理脚本路径 -->
+        <string>/Users/YOUR_USERNAME/.codex/codex_proxy.js</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/.codex</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- 替换为你的 DeepSeek API Key -->
+        <key>OPENAI_API_KEY</key>
+        <string>sk-YOUR_DEEPSEEK_API_KEY</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.codex/proxy.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.codex/proxy.err.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>

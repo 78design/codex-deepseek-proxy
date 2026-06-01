@@ -1,0 +1,15 @@
+# Codex CLI 配置文件
+# 复制此文件为 ~/.codex/config.toml
+
+model = "deepseek-v4-flash"
+model_provider = "deepseek"
+wire_api = "responses"
+model_catalog_json = "~/.codex/model-catalog.json"
+disable_response_storage = true
+approvals_reviewer = "user"
+model_reasoning_effort = "medium"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "http://127.0.0.1:15722/v1"
+env_key = "OPENAI_API_KEY"
