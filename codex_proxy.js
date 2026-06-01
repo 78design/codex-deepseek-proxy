@@ -5,11 +5,10 @@
  * Translates the OpenAI Responses API (used by Codex CLI v0.135.0)
  * to DeepSeek's /v1/chat/completions API, including tool call support.
  *
- * v6 — 修复上下文过快占满：
- *   - token 估算全局保守系数 2.2 chars/token（+~15% 安全边际）
- *   - 裁剪阈值从 900K 降到 650K（+35% 安全边际）
- *   - CJK 正则扩大覆盖范围（含标点、全角符号、日韩文等）
- *   - v5 系统健壮性 + v3 tool_calls 合并 保留
+ * v7 — 修复裁剪孤儿工具消息 + req.on('close')作用域：
+ *   - autoTrim 裁剪后自动跳过开头的孤儿 tool 消息，确保 assistant(tc) → tool 配对
+ *   - req.on('close') 移到 req.on('end') 内部，修复 dsReq 作用域崩溃
+ *   - v6 保守 token 估算 + v5 健壮性 保留
  */
 
 const http = require('http');
@@ -763,7 +762,24 @@ function autoTrim(messages, maxTokens) {
     }
   }
 
-  const trimmed = [...kept, ...tail.slice(tailStart)];
+  const trimmedCandidates = [...kept, ...tail.slice(tailStart)];
+
+  // 确保不以孤儿 tool 消息开头——裁剪可能切掉了前面的 assistant(tool_calls)
+  // DeepSeek 要求 tool 消息前必须有 assistant(tool_calls)
+  let safeStart = 0;
+  if (sysIdx >= 0) { safeStart = 1; } // 跳过 system
+  for (let i = safeStart; i < trimmedCandidates.length; i++) {
+    if (trimmedCandidates[i].role === 'tool') {
+      safeStart = i + 1; // 跳过孤儿 tool
+    } else {
+      break;
+    }
+  }
+  const trimmed = trimmedCandidates.slice(safeStart);
+  if (safeStart > 0 && trimmed.length < trimmedCandidates.length) {
+    console.log('[AUTO_TRIM] 移除开头 %d 条孤儿 tool 消息', trimmedCandidates.length - trimmed.length);
+  }
+
   const afterTokens = estimateTokens(trimmed);
   const removed = messages.length - trimmed.length;
 
@@ -1015,14 +1031,15 @@ http.createServer(function (req, res) {
 
     dsReq.write(postData);
     dsReq.end();
+
+    // 客户端断开时销毁上游请求
+    req.on('close', function () {
+      if (dsReq) { try { dsReq.destroy(); } catch (e) {} }
+    });
   });
 
   req.on('error', function (e) {
     console.error('[CLIENT_REQ_ERR]', e.message);
-  });
-  // 客户端断开时销毁上游请求，避免连接泄漏
-  req.on('close', function () {
-    if (dsReq) { try { dsReq.destroy(); } catch (e) {} }
   });
 }).listen(PORT, '127.0.0.1', function () {
   console.log('[codex_proxy] Running on http://127.0.0.1:' + PORT + '/v1/responses');
