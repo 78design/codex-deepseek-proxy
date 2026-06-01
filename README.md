@@ -4,6 +4,17 @@
 
 让 [OpenAI Codex CLI](https://github.com/openai/codex) 通过本地代理接入 [DeepSeek API](https://platform.deepseek.com/)，无需 OpenAI 付费账号。
 
+## 一键安装
+
+```bash
+# 用你的 DeepSeek API Key 一键安装
+bash install.sh sk-your-deepseek-key
+```
+
+脚本自动完成：Node.js 检查 → Codex CLI 安装 → 代理部署 → 模型目录 → LaunchAgent 开机自启。
+
+安装完后打开新终端，输入 `codex` 即可使用。
+
 ## 工作原理
 
 ```
