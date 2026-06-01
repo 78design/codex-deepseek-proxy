@@ -1,4 +1,9 @@
 # 更新日志
+## v1.0.1 (2026-06-01)
+
+- 上下文超限自动处理：检测到 DeepSeek context length 限制时，返回 200 + 友好提示（`/clear` 或 `/compact`），不再让 Codex 无限重试 400
+- 错误分类处理：context overflow 返回降级消息，其他 API 错误仍正常报错
+
 
 ## v1.0.0 (2026-06-01)
 

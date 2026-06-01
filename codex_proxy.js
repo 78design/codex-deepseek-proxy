@@ -5,10 +5,12 @@
  * Translates the OpenAI Responses API (used by Codex CLI v0.135.0)
  * to DeepSeek's /v1/chat/completions API, including tool call support.
  *
- * v1.0.0 — 核心修复：
- *   - 连续的 function_call item 合并为单条 assistant(tc:N) 消息（而非互不相连的 N 条）
- *   - text-only assistant 的文本和 reasoning_content 自动提升到后续 tool_calls assistant
- *   - flush-on-boundary 策略确保 tool results 紧随正确的 assistant 消息
+ * v4 — 上下文超限自动处理：
+ *   - 检测到上下文超限 400 时，返回 200 + 友好提示，不再让 Codex 无限重试
+ *   - v3 核心修复保留：
+ *     连续的 function_call item 合并为单条 assistant(tc:N) 消息
+ *     text-only assistant 的文本和 reasoning_content 自动提升到 tool_calls assistant
+ *     flush-on-boundary 策略确保 tool results 紧随正确的 assistant 消息
  */
 
 const http = require('http');
@@ -809,17 +811,77 @@ http.createServer(function (req, res) {
           const errMsg = 'DeepSeek HTTP ' + dsRes.statusCode + ': ' + errBody.slice(0, 500);
           console.error('[ERR]', errMsg);
 
-          // 判断是否是不可恢复的错误
-          const isUnrecoverable =
-            errBody.includes('insufficient tool messages') ||
-            errBody.includes('reasoning_content') ||
-            errBody.includes('tool_calls');
+          // 判断错误类型
+          const isContextOverflow =
+            errBody.includes('maximum context length') ||
+            errBody.includes('context length') ||
+            errBody.includes('reduce the length');
 
-          if (isUnrecoverable) {
-            // 不可恢复：告诉 Codex 本轮失败，需要清空上下文重新开始
-            console.error('[FATAL] Unrecoverable error detected — sending failed response to Codex');
+          // 上下文超限 → 返回 200 + 友好提示，Codex 看到正常完成不会重试
+          if (isContextOverflow) {
+            console.error('[CTX_OVERFLOW] 上下文超限，返回降级提示');
+            const tipMsg = [
+              '⚠️ **上下文长度超出 DeepSeek 限制**',
+              '',
+              '当前对话已超过模型支持的 1M token 上限。',
+              '请执行 `/clear` 清空对话历史后重新提问，或用 `/compact` 压缩上下文。',
+              '',
+              '> 提示：`/compact` 会自动总结对话要点，保留关键信息同时大幅减少 token 占用。'
+            ].join('\n');
+
+            const rid = makeId();
+            if (isStream) {
+              // SSE 流模式：发送一个正常的消息告知用户
+              const oid = itemId();
+              sse(res, 'response.created', {
+                type: 'response.created',
+                response: { id: rid, object: 'response', status: 'in_progress', model: model || '', output: [] }
+              });
+              sse(res, 'response.output_item.added', {
+                type: 'response.output_item.added',
+                response_id: rid, output_index: 0,
+                item: { id: oid, type: 'message', role: 'assistant', status: 'in_progress', content: [] }
+              });
+              sse(res, 'response.content_part.added', {
+                type: 'response.content_part.added',
+                response_id: rid, item_id: oid, output_index: 0, content_index: 0,
+                part: { type: 'output_text', text: '' }
+              });
+              sse(res, 'response.output_text.delta', {
+                type: 'response.output_text.delta',
+                response_id: rid, item_id: oid, output_index: 0, content_index: 0, delta: tipMsg
+              });
+              sse(res, 'response.content_part.done', {
+                type: 'response.content_part.done',
+                response_id: rid, item_id: oid, output_index: 0, content_index: 0,
+                part: { type: 'output_text', text: tipMsg }
+              });
+              sse(res, 'response.output_item.done', {
+                type: 'response.output_item.done',
+                response_id: rid, output_index: 0,
+                item: { id: oid, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: tipMsg }] }
+              });
+              sse(res, 'response.completed', {
+                type: 'response.completed',
+                response: {
+                  id: rid, object: 'response', status: 'completed', model: model || '',
+                  output: [{ id: oid, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: tipMsg }] }],
+                  usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+                }
+              });
+              try { res.end(); } catch (e) {}
+            } else {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                id: rid, object: 'response', status: 'completed', model: model || '',
+                output: [{ id: rid + '_msg', type: 'message', role: 'assistant', content: [{ type: 'output_text', text: tipMsg }] }],
+                usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+              }));
+            }
+            return;
           }
 
+          // 其他错误：仍按原逻辑处理
           if (isStream) {
             sendSseErr(res, errMsg);
           } else {
