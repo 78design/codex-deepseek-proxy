@@ -5,12 +5,10 @@
  * Translates the OpenAI Responses API (used by Codex CLI v0.135.0)
  * to DeepSeek's /v1/chat/completions API, including tool call support.
  *
- * v4 — 上下文超限自动处理：
- *   - 检测到上下文超限 400 时，返回 200 + 友好提示，不再让 Codex 无限重试
- *   - v3 核心修复保留：
- *     连续的 function_call item 合并为单条 assistant(tc:N) 消息
- *     text-only assistant 的文本和 reasoning_content 自动提升到 tool_calls assistant
- *     flush-on-boundary 策略确保 tool results 紧随正确的 assistant 消息
+ * v5 — 自动裁剪上下文：
+ *   - 请求前估算消息 token 数，超过 900K 时自动裁剪历史消息
+ *   - 保留 system message + 最近对话，透明降级不中断用户体验
+ *   - v4 上下文超限提示 + v3 核心修复保留
  */
 
 const http = require('http');
@@ -697,6 +695,75 @@ function handleNonStreamingResponse(res, dsRes, reqId, catalogModel) {
 }
 
 // ---------------------------------------------------------------------------
+// Token estimation & auto-trim
+// ---------------------------------------------------------------------------
+
+// 粗略估算消息 token 数（中英文混合：中文 ~1.5 char/token，英文 ~4 char/token）
+function estimateTokens(messages) {
+  let total = 0;
+  for (const m of messages) {
+    // 角色 token 开销约 4
+    total += 4;
+    // 内容 token 估算
+    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+    // 中文字符占比高则用 1.5，纯英文用 4
+    const cjkChars = (content.match(/[一-鿿㐀-䶿]/g) || []).length;
+    const otherChars = content.length - cjkChars;
+    total += Math.ceil(cjkChars / 1.5) + Math.ceil(otherChars / 4);
+    // tool_calls 估算
+    if (m.tool_calls) {
+      const tcJson = JSON.stringify(m.tool_calls);
+      total += Math.ceil(tcJson.length / 3);
+    }
+    // reasoning_content
+    if (m.reasoning_content) {
+      total += Math.ceil(m.reasoning_content.length / 2);
+    }
+  }
+  return total;
+}
+
+// 自动裁剪消息列表，保留 system + 最近 N 条消息
+// maxTokens: 目标 token 上限（默认 900K，DeepSeek V4 限制 1M，留 100K buffer）
+function autoTrim(messages, maxTokens) {
+  maxTokens = maxTokens || 900000;
+  const estimated = estimateTokens(messages);
+  if (estimated <= maxTokens) return { messages, trimmed: 0, before: estimated, after: estimated };
+
+  // 找到 system message 的位置
+  let sysIdx = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'system') { sysIdx = i; break; }
+  }
+
+  // 保留 system + 尾部消息，逐步裁剪头部
+  const kept = sysIdx >= 0 ? [messages[sysIdx]] : [];
+  const startIdx = sysIdx >= 0 ? sysIdx + 1 : 0;
+  const tail = messages.slice(startIdx);
+
+  // 从尾部往前保留，直到 token 数在限制内
+  let tailStart = 0;
+  for (let i = 0; i < tail.length; i++) {
+    const candidate = [...kept, ...tail.slice(i)];
+    if (estimateTokens(candidate) <= maxTokens) {
+      tailStart = i;
+      break;
+    }
+  }
+
+  const trimmed = [...kept, ...tail.slice(tailStart)];
+  const afterTokens = estimateTokens(trimmed);
+  const removed = messages.length - trimmed.length;
+
+  if (removed > 0) {
+    console.log('[AUTO_TRIM] 自动裁剪: %d 条消息, tokens %d → %d (移除了 %d 条历史消息)',
+      messages.length, estimated, afterTokens, removed);
+  }
+
+  return { messages: trimmed, trimmed: removed, before: estimated, after: afterTokens };
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
@@ -729,11 +796,15 @@ http.createServer(function (req, res) {
     }
 
     // Translate input
-    const messages = translateInput(reqBody.input);
+    const rawMessages = translateInput(reqBody.input);
 
     // 调试：打印消息结构
-    console.log('[DEBUG] translated messages:', messages.length,
-      messages.map(m => m.role + (m.tool_calls ? '(tc:' + m.tool_calls.length + ')' : '')).join(' → '));
+    console.log('[DEBUG] translated messages:', rawMessages.length,
+      rawMessages.map(m => m.role + (m.tool_calls ? '(tc:' + m.tool_calls.length + ')' : '')).join(' → '));
+
+    // 自动裁剪：超过 900K tokens 时保留 system + 最近消息
+    const trimResult = autoTrim(rawMessages, 900000);
+    const messages = trimResult.messages;
 
     // Build chat completion request
     const chatBody = {
