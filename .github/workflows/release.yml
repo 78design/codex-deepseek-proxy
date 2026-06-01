@@ -1,0 +1,93 @@
+name: Auto Release
+
+# 当 main 分支有 release: v* 格式的 commit 时自动触发
+# 用法：git commit -m "release: v1.0.1" && git push
+# 之后版本号更新、changelog 生成、tag 创建、Release 发布全部自动完成
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # 只有 commit message 匹配 release: v* 才执行
+    if: startsWith(github.event.head_commit.message, 'release: v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 解析版本号 ──
+      - name: Parse version
+        id: version
+        run: |
+          VERSION=$(echo "${{ github.event.head_commit.message }}" | head -1 | grep -oP 'v\d+\.\d+\.\d+')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version_plain=${VERSION#v}" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      # ── 更新 VERSION 文件 ──
+      - name: Update VERSION file
+        run: echo "${{ steps.version.outputs.version_plain }}" > VERSION
+
+      # ── 更新 README 版本徽章 ──
+      - name: Update README version badge
+        run: |
+          sed -i "s|version-[0-9.]*-blue|version-${{ steps.version.outputs.version_plain }}-blue|g" README.md
+
+      # ── 生成 CHANGELOG ──
+      - name: Generate changelog
+        run: |
+          LAST_TAG=$(git tag --sort=-v:refname | head -1)
+          if [ -z "$LAST_TAG" ]; then
+            echo "## ${{ steps.version.outputs.version }} ($(date +%Y-%m-%d))" > /tmp/changelog.md
+            echo "" >> /tmp/changelog.md
+            git log --pretty=format:"- %s (%h)" >> /tmp/changelog.md
+          else
+            echo "## ${{ steps.version.outputs.version }} ($(date +%Y-%m-%d))" > /tmp/changelog.md
+            echo "" >> /tmp/changelog.md
+            git log ${LAST_TAG}..HEAD --pretty=format:"- %s (%h)" | grep -v "^release:" >> /tmp/changelog.md
+          fi
+          echo "" >> /tmp/changelog.md
+
+          # 写入 CHANGELOG.md（新内容在前）
+          if [ -f CHANGELOG.md ]; then
+            printf "\n" | cat /tmp/changelog.md - CHANGELOG.md > /tmp/merged.md
+            mv /tmp/merged.md CHANGELOG.md
+          else
+            printf "# 更新日志\n\n" > CHANGELOG.md
+            cat /tmp/changelog.md >> CHANGELOG.md
+          fi
+
+          echo "Generated changelog:"
+          head -20 CHANGELOG.md
+
+      # ── 提交版本更新 ──
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION README.md CHANGELOG.md
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git push origin main
+
+      # ── 创建 Git Tag ──
+      - name: Create tag
+        run: |
+          git tag -a ${{ steps.version.outputs.version }} -m "${{ steps.version.outputs.version }}
+          ${{ github.event.head_commit.message }}"
+          git push origin ${{ steps.version.outputs.version }}
+
+      # ── 创建 GitHub Release ──
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          body_path: /tmp/changelog.md
+          generate_release_notes: true

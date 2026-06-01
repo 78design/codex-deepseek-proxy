@@ -4,16 +4,6 @@
 
 让 [OpenAI Codex CLI](https://github.com/openai/codex) 通过本地代理接入 [DeepSeek API](https://platform.deepseek.com/)，无需 OpenAI 付费账号。
 
-## 更新日志
-
-### v1.0.0 (2026-06-01)
-
-- 核心修复：连续 function_call item 合并为单条 assistant(tc:N) 消息
-- text-only assistant 的文本和 reasoning_content 自动提升到后续 tool_calls assistant
-- flush-on-boundary 策略确保 tool results 紧随正确的 assistant 消息
-- 完善的 SSE 错误处理与优雅降级
-- 支持 DeepSeek V4 全系列模型
-
 ## 工作原理
 
 ```
@@ -185,6 +175,28 @@ tail -f ~/.codex/proxy.log
 - **不要将 API Key 提交到代码仓库**。本项目使用环境变量 `OPENAI_API_KEY` 读取密钥
 - plist 示例文件中的 Key 为占位符，使用前需替换
 - 代理仅监听 `127.0.0.1`，不会暴露到公网
+
+## 发布流程
+
+本项目使用 [GitHub Actions](.github/workflows/release.yml) 自动发布。只需要：
+
+```bash
+# 1. 做出修改，正常 commit
+git add -A
+git commit -m "feat: 你的修改说明"
+
+# 2. 用 release: 前缀提交，自动触发发布
+git commit --allow-empty -m "release: v1.0.1"
+git push
+```
+
+之后 GitHub Actions 会自动：
+- 更新 `VERSION` 文件和 README 版本徽章
+- 从 commit 历史生成 `CHANGELOG.md`
+- 创建 Git tag 并推送
+- 生成 GitHub Release 和 Release Notes
+
+[查看完整更新日志 →](CHANGELOG.md)
 
 ## 许可
 
