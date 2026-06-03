@@ -1,6 +1,6 @@
 # Codex DeepSeek Proxy
 
-[![Version](https://img.shields.io/badge/version-3.0.0-blue)](./VERSION)
+[![Version](https://img.shields.io/badge/version-6.0.0-blue)](./VERSION)
 
 让 [OpenAI Codex CLI](https://github.com/openai/codex) 通过本地代理接入 [DeepSeek API](https://platform.deepseek.com/)，无需 OpenAI 付费账号。
 
@@ -19,7 +19,7 @@ bash install.sh sk-your-deepseek-key
 
 ```
 ┌──────────┐   Responses API    ┌─────────────────┐   Chat Completions   ┌──────────────┐
-│ Codex CLI │ ──→ 127.0.0.1:15722 ──→ │  codex_proxy.js  │ ──→ /v1/chat/completions ──→ │ DeepSeek API │
+│ Codex CLI │ ──→ 127.0.0.1:15721 ──→ │  codex_proxy.js  │ ──→ /v1/chat/completions ──→ │ DeepSeek API │
 └──────────┘                     └─────────────────┘                       └──────────────┘
 ```
 
@@ -127,7 +127,7 @@ model = "deepseek-v4-flash"          # 默认模型
 model_provider = "deepseek"          # provider 名称
 wire_api = "responses"               # 使用 Responses API 协议
 model_catalog_json = "~/.codex/model-catalog.json"  # 模型目录
-base_url = "http://127.0.0.1:15722/v1"             # 代理地址
+base_url = "http://127.0.0.1:15721/v1"             # 代理地址
 ```
 
 ### model-catalog.json
@@ -136,9 +136,9 @@ base_url = "http://127.0.0.1:15722/v1"             # 代理地址
 
 ### 自定义端口
 
-默认端口 `15722`。如需修改：
+默认端口 `15721`。如需修改：
 
-1. 编辑 `codex_proxy.js` 底部的 `PORT` 常量
+1. 编辑 `codex_proxy.js` 底部的 `listen()` 调用中的端口号
 2. 同步修改 `config.toml` 中的 `base_url`
 
 ## 故障排查
@@ -146,8 +146,8 @@ base_url = "http://127.0.0.1:15722/v1"             # 代理地址
 ### 代理启动失败 / 端口被占用
 
 ```bash
-lsof -i :15722                    # 查看端口占用
-lsof -ti :15722 | xargs kill -9   # 强制释放
+lsof -i :15721                    # 查看端口占用
+lsof -ti :15721 | xargs kill -9   # 强制释放
 ```
 
 ### Codex 报 "Missing environment variable: OPENAI_API_KEY"
@@ -176,9 +176,9 @@ rm ~/.codex/history.jsonl
 tail -f ~/.codex/proxy.log
 
 # 日志格式
-# [REQ] model=deepseek-v4-flash messages=6 tools=8 stream=true
-# [OK] streaming done, reasoning=135 text=421 tool_calls=0
-# [ERR] DeepSeek HTTP 400: ...
+# [REQ] deepseek-v4-flash msgs=6 tools=8 stream=true
+# [OK] stream: r=135 t=421 tcs=0
+# [ERR] HTTP 400: ...
 ```
 
 ## 安全提醒

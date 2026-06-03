@@ -3,7 +3,7 @@
 # Codex DeepSeek Proxy 一键安装脚本
 # https://github.com/78design/codex-deepseek-proxy
 #
-# 用法: bash install.sh [你的DeepSeek API Key]
+# 用法: bash install.sh [你的DeepSeek API Key] [端口(默认15721)]
 #
 # 做了什么:
 #   1. 安装 Node.js (如果没有)
@@ -40,7 +40,7 @@ if [ -z "$API_KEY" ]; then
 fi
 
 CODEX_HOME="${HOME}/.codex"
-PROXY_PORT="${2:-15722}"
+PROXY_PORT="${2:-15721}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── 1. Node.js ──

@@ -11,5 +11,5 @@ model_reasoning_effort = "medium"
 
 [model_providers.deepseek]
 name = "DeepSeek"
-base_url = "http://127.0.0.1:15722/v1"
+base_url = "http://127.0.0.1:15721/v1"
 env_key = "OPENAI_API_KEY"
