@@ -218,7 +218,45 @@ function handleError(res,errMsg,isStream,model){
 }
 
 // ---- server ----
-var MAX_BODY=52428800;
+var MAX_BODY=52428800, MAX_TOOL_OUTPUT=50000;
+function compactContent(s){
+  if(!s||typeof s!=='string')return s;
+  if(s.length<=MAX_TOOL_OUTPUT)return s;
+  return s.slice(0,MAX_TOOL_OUTPUT)+'\n...[TRUNCATED '+(s.length-MAX_TOOL_OUTPUT)+' bytes]';
+}
+// Compact oversized tool messages in a messages array
+function compactMessages(msgs){
+  for(var i=0;i<msgs.length;i++){
+    var m=msgs[i];
+    if(m.role==='tool'&&typeof m.content==='string'){
+      m.content=compactContent(m.content);
+    }
+  }
+  return msgs;
+}
+// Strip oldest non-system messages, keep system + latest ~40% of messages
+function stripOldMessages(msgs,keepPct){
+  keepPct=keepPct||0.4;
+  if(msgs.length<=3)return msgs;
+  var sysMsg=null;
+  if(msgs[0].role==='system'){sysMsg=msgs[0];msgs=msgs.slice(1);}
+  var keep=Math.max(2,Math.ceil(msgs.length*keepPct));
+  var kept=[];
+  // First find non-tool messages to keep turns intact
+  var cutOff=msgs.length-keep;
+  // Walk from end (newest) to find last user message boundary
+  var lastUser=-1;
+  for(var i=msgs.length-1;i>=cutOff&&i>=0;i--){
+    if(msgs[i].role==='user'){lastUser=i;break;}
+  }
+  if(lastUser>=0)cutOff=lastUser;
+  kept=msgs.slice(cutOff);
+  // Ensure we don't start with orphan tool messages
+  while(kept.length>0&&kept[0].role==='tool')kept.shift();
+  if(kept.length===0)kept=msgs.slice(-2); // last resort: keep last 2
+  if(sysMsg)kept.unshift(sysMsg);
+  return compactMessages(kept);
+}
 http.createServer(function(req,res){
   // GET /v1/models — proxy to DeepSeek
   if(req.method==='GET'&&req.url==='/v1/models'){
@@ -249,12 +287,18 @@ http.createServer(function(req,res){
     }
 
     var msgs=translate(rb.input,prevMsgs);
+    // GLOBAL CAP: truncate oversized tool outputs to prevent context blow-up
+    compactMessages(msgs);
     var mt=rb.max_output_tokens||8192;if(mt>8192)mt=8192;
-    var cb={model:model,max_tokens:mt,stream:isStream,messages:msgs};
-    if(rb.reasoning&&rb.reasoning.effort){var e=rb.reasoning.effort;cb.reasoning_effort=e==='low'||e==='minimal'?'low':e==='medium'?'medium':'high';cb.thinking={type:'enabled'};}
-    var tools=expandTools(rb.tools);if(tools.length)cb.tools=tools;
-    var body=JSON.stringify(cb);
-    console.log('[REQ] '+model+' msgs='+msgs.length+' tools='+tools.length+' stream='+isStream);
+    var tools=expandTools(rb.tools);
+    var retried=false;
+
+    function sendRequest(theMsgs){
+      var cb={model:model,max_tokens:mt,stream:isStream,messages:theMsgs};
+      if(rb.reasoning&&rb.reasoning.effort){var e=rb.reasoning.effort;cb.reasoning_effort=e==='low'||e==='minimal'?'low':e==='medium'?'medium':'high';cb.thinking={type:'enabled'};}
+      if(tools.length)cb.tools=tools;
+      var body=JSON.stringify(cb);
+      console.log('[REQ] '+model+' msgs='+theMsgs.length+' tools='+tools.length+' stream='+isStream+(retried?' (retry)':''));
 
     var dsReq=https.request({
       hostname:'api.deepseek.com',path:'/v1/chat/completions',method:'POST',
@@ -264,6 +308,13 @@ http.createServer(function(req,res){
       if(dsRes.statusCode!==200){
         var eb='';dsRes.on('data',function(c){eb+=c;if(eb.length>4000){dsRes.destroy();}});dsRes.on('end',function(){
           console.error('[ERR] HTTP '+dsRes.statusCode+': '+eb.slice(0,200));
+          // Auto-retry on context overflow: strip old messages and retry once
+          if(!retried&&dsRes.statusCode===400&&(eb.indexOf('context length')>=0||eb.indexOf('maximum context')>=0)){
+            retried=true;
+            console.error('[RETRY] context overflow — stripping old messages');
+            sendRequest(stripOldMessages(theMsgs));
+            return;
+          }
           handleError(res,eb,isStream,model);
         });dsRes.on('error',function(e){console.error('[DS_ERR]',e.message);handleError(res,e.message,isStream,model);});return;
       }
@@ -332,6 +383,8 @@ http.createServer(function(req,res){
     dsReq.on('error',function(e){console.error('[REQ_ERR]',e.message);handleError(res,e.message,isStream,model);});
     dsReq.on('timeout',function(){dsReq.destroy();console.error('[TIMEOUT]');handleError(res,'timeout',isStream,model);});
     dsReq.write(body);dsReq.end();
+  } // end sendRequest
+  sendRequest(msgs);
   });
 }).listen(15721,'127.0.0.1',function(){console.log('[codex_proxy] v6.0 on http://127.0.0.1:15721/v1/responses');console.log('[codex_proxy] using reasoning store — no more token estimation');});
 
