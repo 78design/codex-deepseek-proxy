@@ -156,19 +156,24 @@ function sanitizeSchema(p){
 
 function expandTools(tools){
   var out=[];
+  var deny=process.env.CODEX_TOOL_DENYLIST;
+  var denied={};if(deny)deny.split(',').forEach(function(n){denied[n.trim()]=true;});
   for(var i=0;i<(tools||[]).length;i++){
     var t=tools[i];
     if(t.type==='function'||t.type==='tool'){
+      var name=t.function?t.function.name:t.name;if(name&&denied[name])continue;
       var f=t.function||{name:t.name||'',description:t.description||'',parameters:t.parameters||{}};
       f.parameters=sanitizeSchema(f.parameters);
       out.push({type:'function',function:f});
     }else if(t.type==='namespace'){
       var subs=t.functions||t.tools||[];
       for(var j=0;j<subs.length;j++){
-        var fn=subs[j];
+        var fn=subs[j];var nsName=(t.name||'')+'.'+(fn.name||'');
+        if(denied[nsName]||denied[fn.name||''])continue;
         out.push({type:'function',function:{name:fn.name||'',description:fn.description||t.description||'',parameters:sanitizeSchema(fn.parameters||fn.input_schema||{})}});
       }
     }else if(t.name){
+      if(denied[t.name])continue;
       out.push({type:'function',function:{name:t.name||'',description:t.description||'',parameters:sanitizeSchema(t.parameters||t.input_schema||{})}});
     }
   }
@@ -215,6 +220,17 @@ function handleError(res,errMsg,isStream,model){
 // ---- server ----
 var MAX_BODY=52428800;
 http.createServer(function(req,res){
+  // GET /v1/models — proxy to DeepSeek
+  if(req.method==='GET'&&req.url==='/v1/models'){
+    var mReq=https.get({hostname:'api.deepseek.com',path:'/v1/models',headers:{'Authorization':'Bearer '+KEY},timeout:10000},function(mRes){
+      var body='';mRes.on('data',function(c){body+=c;});mRes.on('end',function(){
+        try{var list=JSON.parse(body);var data=list.data||list.models||[];res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({object:'list',data:data,models:data}));}catch(e){res.writeHead(502);res.end('{}');}
+      });
+    });
+    mReq.on('error',function(){res.writeHead(502);res.end('{}');});
+    mReq.setTimeout(10000,function(){mReq.destroy();res.writeHead(504);res.end('{}');});
+    return;
+  }
   if(req.method!=='POST'||req.url!=='/v1/responses'){res.writeHead(404);res.end('{}');return;}
   var b='',sz=0;
   req.on('error',function(e){console.error('[SRV_ERR]',e.message);try{res.writeHead(500);res.end('{}');}catch(e){}});
@@ -253,11 +269,12 @@ http.createServer(function(req,res){
       }
       if(isStream){
         res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache','Connection':'keep-alive'});
-        var rid=uid('r_'),buf='',rt='',ct='',started=false,sentC=false,oid=uid('i_'),tcm={};
+        var rid=uid('r_'),buf='',rt='',ct='',started=false,sentC=false,oid=uid('i_'),tcm={},streamDone=false;
         dsRes.on('data',function(chunk){
           buf+=chunk.toString();var lines=buf.split('\n');buf=lines.pop()||'';
           for(var i=0;i<lines.length;i++){
-            var line=lines[i].trim();if(!line||line==='data: [DONE]'||line.indexOf('data: ')!==0)continue;
+            var line=lines[i].trim();if(!line||line==='data: [DONE]'){streamDone=true;continue;}
+            if(line.indexOf('data: ')!==0)continue;
             var p;try{p=JSON.parse(line.substring(6));}catch(e){continue;}
             var d=(p.choices||[{}])[0].delta;if(!d)continue;
             if(!started){started=true;esend(res,'response.created',{type:'response.created',response:{id:rid,object:'response',status:'in_progress',model:model,output:[]}});}
@@ -267,8 +284,15 @@ http.createServer(function(req,res){
           }
         });
         dsRes.on('end',function(){
+          if(!streamDone){
+            // Stream disconnected before [DONE] — don't save partial state
+            esend(res,'response.failed',{type:'response.failed',response:{id:rid,status:'failed',error:{code:'stream_incomplete',message:'stream disconnected before completion'}}});
+            try{res.end();}catch(e){}
+            console.error('[STREAM] disconnected before [DONE]');
+            return;
+          }
           if(sentC){esend(res,'response.content_part.done',{type:'response.content_part.done',item_id:oid,output_index:0,content_index:0,part:{type:'output_text',text:ct}});esend(res,'response.output_item.done',{type:'response.output_item.done',output_index:0,item:{id:oid,type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:ct}]}});}
-          var idxs=Object.keys(tcm);
+          var idxs=Object.keys(tcm).sort(function(a,b){return a-b;});
           for(var i=0;i<idxs.length;i++){var tc=tcm[idxs[i]],idx=idxs[i];esend(res,'response.function_call_arguments.done',{type:'response.function_call_arguments.done',item_id:tc.sseId,output_index:+idx+1,arguments:tc.args});esend(res,'response.output_item.done',{type:'response.output_item.done',output_index:+idx+1,item:{id:tc.sseId,type:'function_call',status:'completed',name:tc.name,call_id:tc.id,arguments:tc.args}});}
           var out=[];if(rt)out.push({id:uid('rs_'),type:'reasoning',summary:[{type:'summary_text',text:rt}]});if(sentC)out.push({id:oid,type:'message',role:'assistant',content:[{type:'output_text',text:ct}]});for(var i=0;i<idxs.length;i++)out.push({id:tcm[idxs[i]].sseId,type:'function_call',name:tcm[idxs[i]].name,call_id:tcm[idxs[i]].id,arguments:tcm[idxs[i]].args});
           esend(res,'response.completed',{type:'response.completed',response:{id:rid,object:'response',status:'completed',model:model,output:out}});
@@ -278,6 +302,9 @@ http.createServer(function(req,res){
             var ids=idxs.map(function(k){return tcm[k].id;});
             storeReasoning(rt,ids,ct||'');
           }
+          // Save session history for previous_response_id lookups
+          var histMsgs=msgs.concat([{role:'assistant',content:sentC?ct:null,reasoning_content:rt||undefined,tool_calls:idxs.length?idxs.map(function(k){return {id:tcm[k].id,type:'function',function:{name:tcm[k].name,arguments:tcm[k].args}};}):undefined}]);
+          reasonStore.set('_hist_'+rid,histMsgs);
           console.log('[OK] stream: r='+rt.length+' t='+ct.length+' tcs='+idxs.length);
         });
         dsRes.on('error',function(e){console.error('[DS_ERR]',e.message);try{res.end();}catch(e){}});
@@ -290,8 +317,12 @@ http.createServer(function(req,res){
             var tcIds=(msg.tool_calls||[]).map(function(x){return x.id;});
             storeReasoning(msg.reasoning_content,tcIds,msg.content||'');
           }
+          var nid=uid('r_');
           res.writeHead(200,{'Content-Type':'application/json'});
-          res.end(JSON.stringify({id:uid('r_'),object:'response',status:'completed',model:model,output:out,usage:{input_tokens:u.prompt_tokens||0,output_tokens:u.completion_tokens||0,total_tokens:u.total_tokens||0}}));
+          res.end(JSON.stringify({id:nid,object:'response',status:'completed',model:model,output:out,usage:{input_tokens:u.prompt_tokens||0,output_tokens:u.completion_tokens||0,total_tokens:u.total_tokens||0}}));
+          // Save session history
+          var nhist=msgs.concat([{role:'assistant',content:msg.content||null,reasoning_content:msg.reasoning_content||undefined,tool_calls:msg.tool_calls||undefined}]);
+          reasonStore.set('_hist_'+nid,nhist);
           console.log('[OK] non-stream: '+(u.total_tokens||0)+' tokens');
           }catch(e){res.writeHead(502);res.end(JSON.stringify({error:{message:e.message}}));}
         });
